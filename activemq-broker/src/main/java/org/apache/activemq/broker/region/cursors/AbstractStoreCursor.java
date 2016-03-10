@@ -44,7 +44,7 @@ public abstract class AbstractStoreCursor extends AbstractPendingMessageCursor i
     private Iterator<MessageReference> iterator = null;
     protected boolean batchResetNeeded = false;
     protected int size;
-    private LinkedList<MessageId> pendingCachedIds = new LinkedList<>();
+    private final LinkedList<MessageId> pendingCachedIds = new LinkedList<>();
     private static int SYNC_ADD = 0;
     private static int ASYNC_ADD = 1;
     final MessageId[] lastCachedIds = new MessageId[2];
@@ -97,9 +97,9 @@ public abstract class AbstractStoreCursor extends AbstractPendingMessageCursor i
 
     public synchronized boolean recoverMessage(Message message, boolean cached) throws Exception {
         boolean recovered = false;
+        message.setRegionDestination(regionDestination);
         if (recordUniqueId(message.getMessageId())) {
             if (!cached) {
-                message.setRegionDestination(regionDestination);
                 if( message.getMemoryUsage()==null ) {
                     message.setMemoryUsage(this.getSystemUsage().getMemoryUsage());
                 }
@@ -210,7 +210,7 @@ public abstract class AbstractStoreCursor extends AbstractPendingMessageCursor i
     }
 
     @Override
-    public synchronized boolean addMessageLast(MessageReference node) throws Exception {
+    public synchronized boolean tryAddMessageLast(MessageReference node, long wait) throws Exception {
         boolean disableCache = false;
         if (hasSpace()) {
             if (!isCacheEnabled() && size==0 && isStarted() && useCache) {

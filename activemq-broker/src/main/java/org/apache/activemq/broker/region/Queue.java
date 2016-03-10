@@ -47,6 +47,7 @@ import javax.jms.JMSException;
 import javax.jms.ResourceAllocationException;
 
 import org.apache.activemq.broker.BrokerService;
+import org.apache.activemq.broker.BrokerStoppedException;
 import org.apache.activemq.broker.ConnectionContext;
 import org.apache.activemq.broker.ProducerBrokerExchange;
 import org.apache.activemq.broker.region.cursors.OrderedPendingList;
@@ -285,12 +286,12 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
             }
             // Message could have expired while it was being
             // loaded..
+            message.setRegionDestination(Queue.this);
             if (message.isExpired() && broker.isExpired(message)) {
                 toExpire.add(message);
                 return true;
             }
             if (hasSpace()) {
-                message.setRegionDestination(Queue.this);
                 messagesLock.writeLock().lock();
                 try {
                     try {
@@ -826,9 +827,8 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
         ListenableFuture<Object> result = null;
 
         producerExchange.incrementSend();
-        checkUsage(context, producerExchange, message);
-        sendLock.lockInterruptibly();
-        try {
+        do {
+            checkUsage(context, producerExchange, message);
             message.getMessageId().setBrokerSequenceId(getDestinationSequenceId());
             if (store != null && message.isPersistent()) {
                 message.getMessageId().setFutureOrSequenceLong(null);
@@ -849,13 +849,11 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
                     throw e;
                 }
             }
-            orderedCursorAdd(message, context);
-        } finally {
-            sendLock.unlock();
-        }
-        if (store == null || (!context.isInTransaction() && !message.isPersistent())) {
-            messageSent(context, message);
-        }
+            if(tryOrderedCursorAdd(message, context)) {
+                break;
+            }
+        } while (started.get());
+
         if (result != null && message.isResponseRequired() && !result.isCancelled()) {
             try {
                 result.get();
@@ -866,15 +864,20 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
         }
     }
 
-    private void orderedCursorAdd(Message message, ConnectionContext context) throws Exception {
+    private boolean tryOrderedCursorAdd(Message message, ConnectionContext context) throws Exception {
+        boolean result = true;
+
         if (context.isInTransaction()) {
             context.getTransaction().addSynchronization(new CursorAddSync(new MessageContext(context, message, null)));
         } else if (store != null && message.isPersistent()) {
             doPendingCursorAdditions();
         } else {
             // no ordering issue with non persistent messages
-            cursorAdd(message);
+            result = tryCursorAdd(message);
+            messageSent(context, message);
         }
+
+        return result;
     }
 
     private void checkUsage(ConnectionContext context,ProducerBrokerExchange producerBrokerExchange, Message message) throws ResourceAllocationException, IOException, InterruptedException {
@@ -1132,6 +1135,7 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
 
             // we need a store iterator to walk messages on disk, independent of the cursor which is tracking
             // the next message batch
+        } catch (BrokerStoppedException ignored) {
         } catch (Exception e) {
             LOG.error("Problem retrieving message for browse", e);
         }
@@ -1608,10 +1612,11 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
             }
 
             if (hasBrowsers) {
-                ArrayList<MessageReference> alreadyDispatchedMessages = null;
+                PendingList alreadyDispatchedMessages = isPrioritizedMessages() ?
+                        new PrioritizedPendingList() : new OrderedPendingList();
                 pagedInMessagesLock.readLock().lock();
                 try{
-                    alreadyDispatchedMessages = new ArrayList<MessageReference>(pagedInMessages.values());
+                    alreadyDispatchedMessages.addAll(pagedInMessages);
                 }finally {
                     pagedInMessagesLock.readLock().unlock();
                 }
@@ -1811,10 +1816,19 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
         }
     }
 
-    final boolean cursorAdd(final Message msg) throws Exception {
+    private final boolean cursorAdd(final Message msg) throws Exception {
         messagesLock.writeLock().lock();
         try {
             return messages.addMessageLast(msg);
+        } finally {
+            messagesLock.writeLock().unlock();
+        }
+    }
+
+    private final boolean tryCursorAdd(final Message msg) throws Exception {
+        messagesLock.writeLock().lock();
+        try {
+            return messages.tryAddMessageLast(msg, 50);
         } finally {
             messagesLock.writeLock().unlock();
         }
@@ -1980,6 +1994,16 @@ public class Queue extends BaseDestination implements Task, UsageListener, Index
 
         pagedInPendingDispatchLock.writeLock().lock();
         try {
+            if (isPrioritizedMessages() && !dispatchPendingList.isEmpty() && list != null && !list.isEmpty()) {
+                // merge all to select priority order
+                for (MessageReference qmr : list) {
+                    if (!dispatchPendingList.contains(qmr)) {
+                        dispatchPendingList.addMessageLast(qmr);
+                    }
+                }
+                list = null;
+            }
+
             doActualDispatch(dispatchPendingList);
             // and now see if we can dispatch the new stuff.. and append to the pending
             // list anything that does not actually get dispatched.

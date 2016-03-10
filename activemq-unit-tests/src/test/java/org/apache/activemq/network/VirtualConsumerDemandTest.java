@@ -21,7 +21,6 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
-import java.io.File;
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.util.Arrays;
@@ -29,7 +28,6 @@ import java.util.Collection;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 
-import javax.jms.Connection;
 import javax.jms.JMSException;
 import javax.jms.Message;
 import javax.jms.MessageConsumer;
@@ -58,9 +56,7 @@ import org.apache.activemq.util.Wait;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
@@ -75,7 +71,7 @@ import com.google.common.collect.Lists;
  * as demand.
  */
 @RunWith(Parameterized.class)
-public class VirtualConsumerDemandTest {
+public class VirtualConsumerDemandTest extends DynamicNetworkTestSupport {
 
     protected static final int MESSAGE_COUNT = 10;
     private static final Logger LOG = LoggerFactory.getLogger(VirtualConsumerDemandTest.class);
@@ -96,24 +92,13 @@ public class VirtualConsumerDemandTest {
         });
     }
 
-    protected Connection localConnection;
-    protected Connection remoteConnection;
-    protected BrokerService localBroker;
-    protected BrokerService remoteBroker;
+
     protected JavaRuntimeConfigurationBroker runtimeBroker;
-    protected Session localSession;
-    protected Session remoteSession;
-    protected ActiveMQTopic included;
-    protected ActiveMQTopic excluded;
     protected String consumerName = "durableSubs";
-    protected String testTopicName = "include.test.bar";
     protected String testQueueName = "include.test.foo";
 
     private final boolean isDuplex;
     private final boolean isUseVirtualDestSubsOnCreation;
-
-    @Rule
-    public TemporaryFolder tempFolder = new TemporaryFolder(new File("target"));
 
 
     public VirtualConsumerDemandTest(boolean isDuplex, boolean isUseVirtualDestSubsOnCreation) {
@@ -287,6 +272,56 @@ public class VirtualConsumerDemandTest {
         assertAdvisoryBrokerCounts(1,1,1);
     }
 
+
+    /**
+     * Test that dynamic flow works for virtual destinations when a second composite
+     * topic is included that forwards to the same queue, but is excluded from
+     * being forwarded from the remote broker
+     *
+     * @throws Exception
+     */
+    @Test(timeout = 60 * 1000)
+    public void testSecondNonIncludedCompositeTopicForwardSameQueue() throws Exception {
+        Assume.assumeTrue(isUseVirtualDestSubsOnCreation);
+
+        doSetUp(true, null);
+
+        MessageConsumer advisoryConsumer = getVirtualDestinationAdvisoryConsumer(testTopicName);
+
+        //configure a composite topic that isn't included
+        CompositeTopic compositeTopic = createCompositeTopic("include.test.bar2",
+                new ActiveMQQueue("include.test.bar.bridge"));
+
+        runtimeBroker.setVirtualDestinations(new VirtualDestination[] {compositeTopic}, true);
+
+        Thread.sleep(2000);
+
+        //add one that is included
+        CompositeTopic compositeTopic2 = createCompositeTopic(testTopicName,
+                new ActiveMQQueue("include.test.bar.bridge"));
+
+        runtimeBroker.setVirtualDestinations(new VirtualDestination[] {compositeTopic, compositeTopic2}, true);
+
+        Thread.sleep(2000);
+        MessageProducer includedProducer = localSession.createProducer(included);
+        Message test = localSession.createTextMessage("test");
+
+        final DestinationStatistics destinationStatistics = localBroker.getDestination(included).getDestinationStatistics();
+        final DestinationStatistics remoteDestStatistics = remoteBroker.getDestination(
+                new ActiveMQQueue("include.test.bar.bridge")).getDestinationStatistics();
+
+        waitForConsumerCount(destinationStatistics, 1);
+
+        includedProducer.send(test);
+
+        waitForDispatchFromLocalBroker(destinationStatistics, 1);
+        assertLocalBrokerStatistics(destinationStatistics, 1);
+        assertEquals("remote dest messages", 1, remoteDestStatistics.getMessages().getCount());
+
+        assertRemoteAdvisoryCount(advisoryConsumer, 1);
+        assertAdvisoryBrokerCounts(2,2,2);
+
+    }
 
     /**
      * Test that dynamic flow works for virtual destinations when a second composite
@@ -506,6 +541,59 @@ public class VirtualConsumerDemandTest {
         //1 because a send causes the queue to be recreated again which sends a new demand advisory
         assertRemoteAdvisoryCount(advisoryConsumer, 1);
         assertAdvisoryBrokerCounts(1,2,2);
+
+    }
+
+    /**
+     * This tests that having 2 composite destinations (1 included for dynamic flow and 1 not)
+     * will allow messages to flow and that deleting 1 destination dosen't clear out the virtual
+     * consumer map except for what should be cleared.
+     *
+     */
+    @Test(timeout = 60 * 1000)
+    public void testTwoCompositeTopicsRemove1() throws Exception {
+        Assume.assumeTrue(isUseVirtualDestSubsOnCreation);
+
+        doSetUp(true, null);
+
+        //configure a virtual destination that forwards messages from topic testQueueName
+        //to queue "include.test.bar.bridge" and "include.test.bar.bridge2"
+        CompositeTopic compositeTopic1 = createCompositeTopic(testTopicName,
+                new ActiveMQQueue("include.test.bar.bridge"));
+        CompositeTopic compositeTopic2 = createCompositeTopic(testTopicName + 2,
+                new ActiveMQQueue("include.test.bar.bridge2"));
+
+        runtimeBroker.setVirtualDestinations(new VirtualDestination[] {compositeTopic1, compositeTopic2}, true);
+
+        MessageProducer includedProducer = localSession.createProducer(included);
+        Message test = localSession.createTextMessage("test");
+        Thread.sleep(1000);
+
+        final DestinationStatistics destinationStatistics = localBroker.getDestination(included).getDestinationStatistics();
+        final DestinationStatistics remoteDestStatistics = remoteBroker.getDestination(
+                new ActiveMQQueue("include.test.bar.bridge")).getDestinationStatistics();
+
+        waitForConsumerCount(destinationStatistics, 1);
+
+        includedProducer.send(test);
+
+        waitForDispatchFromLocalBroker(destinationStatistics, 1);
+        assertLocalBrokerStatistics(destinationStatistics, 1);
+        assertEquals("remote dest messages", 1, remoteDestStatistics.getMessages().getCount());
+
+        //verify there are 2 virtual destinations but only 1 consumer and broker dest
+        assertAdvisoryBrokerCounts(2,1,1);
+        runtimeBroker.setVirtualDestinations(new VirtualDestination[] {compositeTopic1}, true);
+        Thread.sleep(2000);
+        //verify there is is only 1 virtual dest after deletion
+        assertAdvisoryBrokerCounts(1,1,1);
+
+        includedProducer.send(test);
+
+        //make sure messages are still forwarded even after 1 composite topic was deleted
+        waitForDispatchFromLocalBroker(destinationStatistics, 2);
+        assertLocalBrokerStatistics(destinationStatistics, 2);
+        assertEquals("remote dest messages", 2, remoteDestStatistics.getMessages().getCount());
 
     }
 
@@ -790,8 +878,8 @@ public class VirtualConsumerDemandTest {
         MessageConsumer advisoryConsumer = getVirtualDestinationAdvisoryConsumer(testTopicName);
 
         //configure a virtual destination that forwards messages to an excluded destination
-        CompositeTopic compositeTopic = createCompositeTopic("excluded.test.bar",
-                new ActiveMQQueue("excluded.test.bar.bridge"));
+        CompositeTopic compositeTopic = createCompositeTopic("exclude.test.bar",
+                new ActiveMQQueue("exclude.test.bar.bridge"));
 
         runtimeBroker.setVirtualDestinations(new VirtualDestination[] {compositeTopic}, true);
 
@@ -799,7 +887,7 @@ public class VirtualConsumerDemandTest {
         Message test = localSession.createTextMessage("test");
         Thread.sleep(1000);
 
-        MessageConsumer bridgeConsumer = remoteSession.createConsumer(new ActiveMQQueue("excluded.test.bar.bridge"));
+        MessageConsumer bridgeConsumer = remoteSession.createConsumer(new ActiveMQQueue("exclude.test.bar.bridge"));
         Thread.sleep(2000);
         includedProducer.send(test);
         assertNull(bridgeConsumer.receive(5000));
@@ -1302,12 +1390,7 @@ public class VirtualConsumerDemandTest {
         remoteAdvisoryBroker = (AdvisoryBroker)
                 brokerService.getBroker().getAdaptor(AdvisoryBroker.class);
 
-        NetworkConnector connector = new DiscoveryNetworkConnector(new URI("static:(tcp://localhost:61616)"));
-        brokerService.addNetworkConnector(connector);
-
         brokerService.addConnector("tcp://localhost:61617");
-
-
 
         return brokerService;
     }
@@ -1330,27 +1413,6 @@ public class VirtualConsumerDemandTest {
         return compositeQueue;
     }
 
-    protected void waitForConsumerCount(final DestinationStatistics destinationStatistics, final int count) throws Exception {
-        Wait.waitFor(new Wait.Condition() {
-            @Override
-            public boolean isSatisified() throws Exception {
-                //should only be 1 for the composite destination creation
-                return count == destinationStatistics.getConsumers().getCount();
-            }
-        });
-    }
-
-    protected void waitForDispatchFromLocalBroker(final DestinationStatistics destinationStatistics, final int count) throws Exception {
-        Wait.waitFor(new Wait.Condition() {
-            @Override
-            public boolean isSatisified() throws Exception {
-                return count == destinationStatistics.getDequeues().getCount() &&
-                       count == destinationStatistics.getDispatched().getCount() &&
-                       count == destinationStatistics.getForwards().getCount();
-            }
-        });
-    }
-
     protected MessageConsumer getVirtualDestinationAdvisoryConsumer(String topic) throws JMSException {
         return remoteSession.createConsumer(AdvisorySupport.getVirtualDestinationConsumerAdvisoryTopic(
                 new ActiveMQTopic(topic)));
@@ -1361,18 +1423,12 @@ public class VirtualConsumerDemandTest {
                 new ActiveMQQueue(queue)));
     }
 
-    protected void assertLocalBrokerStatistics(final DestinationStatistics localStatistics, final int count) {
-        assertEquals("local broker dest stat dispatched", count, localStatistics.getDispatched().getCount());
-        assertEquals("local broker dest stat dequeues", count, localStatistics.getDequeues().getCount());
-        assertEquals("local broker dest stat forwards", count, localStatistics.getForwards().getCount());
-    }
-
     protected void assertRemoteAdvisoryCount(final MessageConsumer advisoryConsumer, final int count) throws JMSException {
         int available = 0;
         ActiveMQMessage message = null;
         while ((message = (ActiveMQMessage) advisoryConsumer.receive(1000)) != null) {
             available++;
-            LOG.debug("advisory data structure: {}", message.getDataStructure());
+            LOG.info("advisory data structure: {}", message.getDataStructure());
         }
         assertEquals(count, available);
     }

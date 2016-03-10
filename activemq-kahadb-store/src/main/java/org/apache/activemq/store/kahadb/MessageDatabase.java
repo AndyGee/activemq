@@ -399,6 +399,9 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                     pageFile.delete();
                 }
                 metadata = createMetadata();
+                //The metadata was recreated after a detect corruption so we need to
+                //reconfigure anything that was configured on the old metadata on startup
+                configureMetadata();
                 pageFile = null;
                 loadPageFile();
             }
@@ -446,8 +449,9 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                     checkpointThread.join();
                 }
             }
-            //clear the cache on shutdown of the store
+            //clear the cache and journalSize on shutdown of the store
             storeCache.clear();
+            journalSize.set(0);
         }
     }
 
@@ -761,12 +765,14 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
 
             for (Long sequenceId : matches) {
                 MessageKeys keys = sd.orderIndex.remove(tx, sequenceId);
-                sd.locationIndex.remove(tx, keys.location);
-                sd.messageIdIndex.remove(tx, keys.messageId);
-                metadata.producerSequenceIdTracker.rollback(keys.messageId);
-                undoCounter++;
-                decrementAndSubSizeToStoreStat(key, keys.location.getSize());
-                // TODO: do we need to modify the ack positions for the pub sub case?
+                if (keys != null) {
+                    sd.locationIndex.remove(tx, keys.location);
+                    sd.messageIdIndex.remove(tx, keys.messageId);
+                    metadata.producerSequenceIdTracker.rollback(keys.messageId);
+                    undoCounter++;
+                    decrementAndSubSizeToStoreStat(key, keys.location.getSize());
+                    // TODO: do we need to modify the ack positions for the pub sub case?
+                }
             }
         }
 
@@ -819,14 +825,21 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
         while (!ss.isEmpty()) {
             missingJournalFiles.add((int) ss.removeFirst());
         }
-        missingJournalFiles.removeAll(journal.getFileMap().keySet());
 
-        if (!missingJournalFiles.isEmpty()) {
-            if (LOG.isInfoEnabled()) {
-                LOG.info("Some journal files are missing: " + missingJournalFiles);
+        for (Entry<Integer, Set<Integer>> entry : metadata.ackMessageFileMap.entrySet()) {
+            missingJournalFiles.add(entry.getKey());
+            for (Integer i : entry.getValue()) {
+                missingJournalFiles.add(i);
             }
         }
 
+        missingJournalFiles.removeAll(journal.getFileMap().keySet());
+
+        if (!missingJournalFiles.isEmpty()) {
+            LOG.warn("Some journal files are missing: " + missingJournalFiles);
+        }
+
+        ArrayList<BTreeVisitor.Predicate<Location>> knownCorruption = new ArrayList<BTreeVisitor.Predicate<Location>>();
         ArrayList<BTreeVisitor.Predicate<Location>> missingPredicates = new ArrayList<BTreeVisitor.Predicate<Location>>();
         for (Integer missing : missingJournalFiles) {
             missingPredicates.add(new BTreeVisitor.BetweenVisitor<Location, Long>(new Location(missing, 0), new Location(missing + 1, 0)));
@@ -836,10 +849,14 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
             Collection<DataFile> dataFiles = journal.getFileMap().values();
             for (DataFile dataFile : dataFiles) {
                 int id = dataFile.getDataFileId();
+                // eof to next file id
                 missingPredicates.add(new BTreeVisitor.BetweenVisitor<Location, Long>(new Location(id, dataFile.getLength()), new Location(id + 1, 0)));
                 Sequence seq = dataFile.getCorruptedBlocks().getHead();
                 while (seq != null) {
-                    missingPredicates.add(new BTreeVisitor.BetweenVisitor<Location, Long>(new Location(id, (int) seq.getFirst()), new Location(id, (int) seq.getLast() + 1)));
+                    BTreeVisitor.BetweenVisitor<Location, Long> visitor =
+                        new BTreeVisitor.BetweenVisitor<Location, Long>(new Location(id, (int) seq.getFirst()), new Location(id, (int) seq.getLast() + 1));
+                    missingPredicates.add(visitor);
+                    knownCorruption.add(visitor);
                     seq = seq.getNext();
                 }
             }
@@ -856,7 +873,7 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                     }
                 });
 
-                // If somes message references are affected by the missing data files...
+                // If some message references are affected by the missing data files...
                 if (!matches.isEmpty()) {
 
                     // We either 'gracefully' recover dropping the missing messages or
@@ -873,9 +890,22 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                             // TODO: do we need to modify the ack positions for the pub sub case?
                         }
                     } else {
-                        throw new IOException("Detected missing/corrupt journal files. "+matches.size()+" messages affected.");
+                        LOG.error("[" + sdEntry.getKey() + "] references corrupt locations. " + matches.size() + " messages affected.");
+                        throw new IOException("Detected missing/corrupt journal files referenced by:[" + sdEntry.getKey() + "] " +matches.size()+" messages affected.");
                     }
                 }
+            }
+        }
+
+        if (!ignoreMissingJournalfiles) {
+            if (!knownCorruption.isEmpty()) {
+                LOG.error("Detected corrupt journal files. " + knownCorruption);
+                throw new IOException("Detected corrupt journal files. " + knownCorruption);
+            }
+
+            if (!missingJournalFiles.isEmpty()) {
+                LOG.error("Detected missing journal files. " + missingJournalFiles);
+                throw new IOException("Detected missing journal files. " + missingJournalFiles);
             }
         }
 
@@ -1383,7 +1413,8 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
             }
             metadata.lastUpdate = location;
         } else {
-            LOG.warn("Non existent message update attempt rejected. Destination: {}://{}, Message id: {}", command.getDestination().getType(), command.getDestination().getName(), command.getMessageId());
+            //Add the message if it can't be found
+            this.updateIndex(tx, command, location);
         }
     }
 
@@ -1678,7 +1709,9 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
 
                             // When pending is size one that is the next message Id meaning there
                             // are no pending messages currently.
-                            if (pendingAcks == null || pendingAcks.size() <= 1) {
+                            if (pendingAcks == null || pendingAcks.isEmpty() ||
+                                (pendingAcks.size() == 1 && pendingAcks.getTail().range() == 1)) {
+
                                 if (LOG.isTraceEnabled()) {
                                     LOG.trace("Found candidate for rewrite: {} from file {}", entry.getKey(), dataFileId);
                                 }
@@ -1708,7 +1741,9 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
             // check we are not deleting file with ack for in-use journal files
             if (LOG.isTraceEnabled()) {
                 LOG.trace("gc candidates: " + gcCandidateSet);
+                LOG.trace("ackMessageFileMap: " +  metadata.ackMessageFileMap);
             }
+            boolean ackMessageFileMapMod = false;
             Iterator<Integer> candidates = gcCandidateSet.iterator();
             while (candidates.hasNext()) {
                 Integer candidate = candidates.next();
@@ -1722,7 +1757,7 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                         }
                     }
                     if (gcCandidateSet.contains(candidate)) {
-                        metadata.ackMessageFileMap.remove(candidate);
+                        ackMessageFileMapMod |= (metadata.ackMessageFileMap.remove(candidate) != null);
                     } else {
                         if (LOG.isTraceEnabled()) {
                             LOG.trace("not removing data file: " + candidate
@@ -1737,6 +1772,14 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                     LOG.debug("Cleanup removing the data files: " + gcCandidateSet);
                 }
                 journal.removeDataFiles(gcCandidateSet);
+                for (Integer candidate : gcCandidateSet) {
+                    for (Set<Integer> ackFiles : metadata.ackMessageFileMap.values()) {
+                        ackMessageFileMapMod |= ackFiles.remove(candidate);
+                    }
+                }
+                if (ackMessageFileMapMod) {
+                    checkpointUpdate(tx, false);
+                }
             }
         }
 
@@ -1822,18 +1865,18 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
         }
     }
 
-    static protected class MessageKeysMarshaller extends VariableMarshaller<MessageKeys> {
-        static final MessageKeysMarshaller INSTANCE = new MessageKeysMarshaller();
+    protected class MessageKeysMarshaller extends VariableMarshaller<MessageKeys> {
+        final LocationSizeMarshaller locationSizeMarshaller = new LocationSizeMarshaller();
 
         @Override
         public MessageKeys readPayload(DataInput dataIn) throws IOException {
-            return new MessageKeys(dataIn.readUTF(), LocationMarshaller.INSTANCE.readPayload(dataIn));
+            return new MessageKeys(dataIn.readUTF(), locationSizeMarshaller.readPayload(dataIn));
         }
 
         @Override
         public void writePayload(MessageKeys object, DataOutput dataOut) throws IOException {
             dataOut.writeUTF(object.messageId);
-            LocationMarshaller.INSTANCE.writePayload(object.location, dataOut);
+            locationSizeMarshaller.writePayload(object.location, dataOut);
         }
     }
 
@@ -2138,6 +2181,13 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
                 Entry<Location, Long> entry = iterator.next();
                 // modify so it is upgraded
                 rc.locationIndex.put(tx, entry.getKey(), entry.getValue());
+            }
+            //upgrade the order index
+            for (Iterator<Entry<Long, MessageKeys>> iterator = rc.orderIndex.iterator(tx); iterator.hasNext(); ) {
+                Entry<Long, MessageKeys> entry = iterator.next();
+                //call get so that the last priority is updated
+                rc.orderIndex.get(tx, entry.getKey());
+                rc.orderIndex.put(tx, rc.orderIndex.lastGetPriority(), entry.getKey(), entry.getValue());
             }
         }
 
@@ -2538,31 +2588,28 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
     }
 
     public long getStoredMessageSize(Transaction tx, StoredDestination sd, String subscriptionKey) throws IOException {
+        //grab the messages attached to this subscription
         SequenceSet messageSequences = sd.ackPositions.get(tx, subscriptionKey);
+
         long locationSize = 0;
         if (messageSequences != null) {
-            Iterator<Long> sequences = messageSequences.iterator();
+            Sequence head = messageSequences.getHead();
+            if (head != null) {
+                //get an iterator over the order index starting at the first unacked message
+                //and go over each message to add up the size
+                Iterator<Entry<Long, MessageKeys>> iterator = sd.orderIndex.iterator(tx,
+                        new MessageOrderCursor(head.getFirst()));
 
-            while (sequences.hasNext()) {
-                Long sequenceId = sequences.next();
-                //the last item is the next marker
-                if (!sequences.hasNext()) {
-                    break;
-                }
-                Iterator<Entry<Location, Long>> iterator = sd.locationIndex.iterator(tx);
                 while (iterator.hasNext()) {
-                    Entry<Location, Long> entry = iterator.next();
-                    if (entry.getValue() == sequenceId - 1) {
-                        locationSize += entry.getKey().getSize();
-                        break;
-                    }
-
+                    Entry<Long, MessageKeys> entry = iterator.next();
+                    locationSize += entry.getValue().location.getSize();
                 }
             }
         }
 
         return locationSize;
     }
+
     protected String key(KahaDestination destination) {
         return destination.getType().getNumber() + ":" + destination.getName();
     }
@@ -2723,6 +2770,8 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
         md.producerSequenceIdTracker.setMaximumNumberOfProducersToTrack(getMaxFailoverProducersToTrack());
         return md;
     }
+
+    protected abstract void configureMetadata();
 
     public int getJournalMaxWriteBatchSize() {
         return journalMaxWriteBatchSize;
@@ -3021,6 +3070,7 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
         Long lastLowKey;
         byte lastGetPriority;
         final List<Long> pendingAdditions = new LinkedList<Long>();
+        final MessageKeysMarshaller messageKeysMarshaller = new MessageKeysMarshaller();
 
         MessageKeys remove(Transaction tx, Long key) throws IOException {
             MessageKeys result = defaultPriorityIndex.remove(tx, key);
@@ -3035,13 +3085,13 @@ public abstract class MessageDatabase extends ServiceSupport implements BrokerSe
 
         void load(Transaction tx) throws IOException {
             defaultPriorityIndex.setKeyMarshaller(LongMarshaller.INSTANCE);
-            defaultPriorityIndex.setValueMarshaller(MessageKeysMarshaller.INSTANCE);
+            defaultPriorityIndex.setValueMarshaller(messageKeysMarshaller);
             defaultPriorityIndex.load(tx);
             lowPriorityIndex.setKeyMarshaller(LongMarshaller.INSTANCE);
-            lowPriorityIndex.setValueMarshaller(MessageKeysMarshaller.INSTANCE);
+            lowPriorityIndex.setValueMarshaller(messageKeysMarshaller);
             lowPriorityIndex.load(tx);
             highPriorityIndex.setKeyMarshaller(LongMarshaller.INSTANCE);
-            highPriorityIndex.setValueMarshaller(MessageKeysMarshaller.INSTANCE);
+            highPriorityIndex.setValueMarshaller(messageKeysMarshaller);
             highPriorityIndex.load(tx);
         }
 

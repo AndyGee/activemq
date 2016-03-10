@@ -55,19 +55,23 @@ public class StompWSConnection extends WebSocketAdapter implements WebSocketList
         }
     }
 
+    protected Session getConnection() {
+        return connection;
+    }
+
     //---- Send methods ------------------------------------------------------//
 
-    public void sendRawFrame(String rawFrame) throws Exception {
+    public synchronized void sendRawFrame(String rawFrame) throws Exception {
         checkConnected();
         connection.getRemote().sendString(rawFrame);
     }
 
-    public void sendFrame(StompFrame frame) throws Exception {
+    public synchronized void sendFrame(StompFrame frame) throws Exception {
         checkConnected();
         connection.getRemote().sendString(frame.format());
     }
 
-    public void keepAlive() throws Exception {
+    public synchronized void keepAlive() throws Exception {
         checkConnected();
         connection.getRemote().sendString("\n");
     }

@@ -40,13 +40,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.activemq.broker.SslContext;
 import org.apache.activemq.command.Command;
 import org.apache.activemq.command.ConnectionControl;
-import org.apache.activemq.command.ConsumerControl;
 import org.apache.activemq.command.ConnectionId;
+import org.apache.activemq.command.ConsumerControl;
 import org.apache.activemq.command.MessageDispatch;
 import org.apache.activemq.command.MessagePull;
 import org.apache.activemq.command.RemoveInfo;
 import org.apache.activemq.command.Response;
-
 import org.apache.activemq.state.ConnectionStateTracker;
 import org.apache.activemq.state.Tracked;
 import org.apache.activemq.thread.Task;
@@ -130,7 +129,7 @@ public class FailoverTransport implements CompositeTransport {
     private String nestedExtraQueryOptions;
     private boolean shuttingDown = false;
 
-    public FailoverTransport() throws InterruptedIOException {
+    public FailoverTransport() {
         brokerSslContext = SslContext.getCurrentSslContext();
         stateTracker.setTrackTransactions(true);
         // Setup a task that is used to reconnect the a connection async.
@@ -270,7 +269,7 @@ public class FailoverTransport implements CompositeTransport {
                 if (canReconnect()) {
                     reconnectOk = true;
                 }
-                 LOG.warn("Transport (" + connectedTransportURI + ") failed"
+                LOG.warn("Transport (" + connectedTransportURI + ") failed"
                         + (reconnectOk ? "," : ", not") + " attempting to automatically reconnect", e);
 
                 failedConnectTransportURI = connectedTransportURI;
@@ -840,7 +839,6 @@ public class FailoverTransport implements CompositeTransport {
 
     @Override
     public <T> T narrow(Class<T> target) {
-
         if (target.isAssignableFrom(getClass())) {
             return target.cast(this);
         }
@@ -849,7 +847,6 @@ public class FailoverTransport implements CompositeTransport {
             return transport.narrow(target);
         }
         return null;
-
     }
 
     protected void restoreTransport(Transport t) throws Exception, IOException {
@@ -991,6 +988,7 @@ public class FailoverTransport implements CompositeTransport {
                             backups.remove(bt);
                             transport = bt.getTransport();
                             uri = bt.getUri();
+                            myTransportListener.onCommand(bt.getBrokerInfo());
                             if (priorityBackup && priorityBackupAvailable) {
                                 Transport old = this.connectedTransport.getAndSet(null);
                                 if (old != null) {
@@ -1166,7 +1164,7 @@ public class FailoverTransport implements CompositeTransport {
     }
 
     /*
-      * called with reconnectMutex held
+     * called with reconnectMutex held
      */
     private void propagateFailureToExceptionListener(Exception exception) {
         if (transportListener != null) {
@@ -1258,9 +1256,17 @@ public class FailoverTransport implements CompositeTransport {
         }
 
         if (!priorityList.isEmpty()) {
-            return priorityList.contains(uri);
+            for (URI priorityURI : priorityList) {
+                if (compareURIs(priorityURI, uri)) {
+                    return true;
+                }
+            }
+
+        } else if (!uris.isEmpty()) {
+            return compareURIs(uris.get(0), uri);
         }
-        return uris.indexOf(uri) == 0;
+
+        return false;
     }
 
     @Override
@@ -1369,6 +1375,10 @@ public class FailoverTransport implements CompositeTransport {
         return stateTracker;
     }
 
+    public boolean isConnectedToPriority() {
+        return connectedToPriority;
+    }
+
     private boolean contains(URI newURI) {
         boolean result = false;
         for (URI uri : uris) {
@@ -1467,5 +1477,4 @@ public class FailoverTransport implements CompositeTransport {
     public void setWarnAfterReconnectAttempts(int warnAfterReconnectAttempts) {
         this.warnAfterReconnectAttempts = warnAfterReconnectAttempts;
     }
-
 }

@@ -21,9 +21,7 @@ import java.io.InputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectStreamClass;
 import java.lang.reflect.Proxy;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Map;
+import java.util.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,16 +34,20 @@ public class ClassLoadingAwareObjectInputStream extends ObjectInputStream {
 
     public static final String[] serializablePackages;
 
+    private List<String> trustedPackages = new ArrayList<String>();
+    private boolean trustAllPackages = false;
+
     private final ClassLoader inLoader;
 
     static {
         serializablePackages = System.getProperty("org.apache.activemq.SERIALIZABLE_PACKAGES",
-                    "java.lang,java.util,org.apache.activemq,org.fusesource.hawtbuf,com.thoughtworks.xstream.mapper").split(",");
+                    "java.lang,javax.security,java.util,org.apache.activemq,org.fusesource.hawtbuf,com.thoughtworks.xstream.mapper").split(",");
     }
 
     public ClassLoadingAwareObjectInputStream(InputStream in) throws IOException {
         super(in);
         inLoader = in.getClass().getClassLoader();
+        trustedPackages.addAll(Arrays.asList(serializablePackages));
     }
 
     @Override
@@ -92,19 +94,22 @@ public class ClassLoadingAwareObjectInputStream extends ObjectInputStream {
         return serializablePackages.length == 1 && serializablePackages[0].equals("*");
     }
 
+    private boolean trustAllPackages() {
+        return trustAllPackages || (trustedPackages.size() == 1 && trustedPackages.get(0).equals("*"));
+    }
+
     private void checkSecurity(Class clazz) throws ClassNotFoundException {
         if (!clazz.isPrimitive()) {
-            if (clazz.getPackage() != null && !isAllAllowed()) {
+            if (clazz.getPackage() != null && !trustAllPackages()) {
                boolean found = false;
-               for (String packageName : serializablePackages) {
+               for (String packageName : getTrustedPackages()) {
                    if (clazz.getPackage().getName().equals(packageName) || clazz.getPackage().getName().startsWith(packageName + ".")) {
                        found = true;
                        break;
                    }
                }
-
                if (!found) {
-                   throw new ClassNotFoundException("Forbidden " + clazz + "! This class is not allowed to be serialized. Add package with 'org.apache.activemq.SERIALIZABLE_PACKAGES' system property.");
+                   throw new ClassNotFoundException("Forbidden " + clazz + "! This class is not trusted to be serialized as ObjectMessage payload. Please take a look at http://activemq.apache.org/objectmessage.html for more information on how to configure trusted classes.");
                }
             }
         }
@@ -193,4 +198,23 @@ public class ClassLoadingAwareObjectInputStream extends ObjectInputStream {
         return null;
     }
 
+    public List<String> getTrustedPackages() {
+        return trustedPackages;
+    }
+
+    public void setTrustedPackages(List<String> trustedPackages) {
+        this.trustedPackages = trustedPackages;
+    }
+
+    public void addTrustedPackage(String trustedPackage) {
+        this.trustedPackages.add(trustedPackage);
+    }
+
+    public boolean isTrustAllPackages() {
+        return trustAllPackages;
+    }
+
+    public void setTrustAllPackages(boolean trustAllPackages) {
+        this.trustAllPackages = trustAllPackages;
+    }
 }
